@@ -1,0 +1,322 @@
+Yes, noted. Your current run reached a healthy but still early checkpoint:
+
+Version: 2026.05.01.laptop-tuned-naics-first-soc
+candidate_models=sgd,linear_svc,complement_nb
+FAISS: working
+Embedding cache: working
+Feature matrix built
+Current stage: [naics] CV candidate: sgd_log_elasticnet
+
+That means the script has not failed. It is evaluating the first NAICS supervised model. The scary PowerShell block:
+
+CategoryInfo : NotSpecified
+FullyQualifiedErrorId : NativeCommandError
+
+is attached to this warning:
+
+Warning: You are sending unauthenticated requests to the HF Hub.
+
+That is not the autocoder crashing. It is a warning emitted on stderr, and PowerShell dresses stderr up like an error goblin. Since the embeddings were loaded from cache right after, it is not blocking the run.
+
+The important new information from your GPU probe is:
+
+NVIDIA GeForce RTX 2050 detected
+nvidia-smi works
+CUDA Version shown by driver: 12.8
+Current torch: 2.11.0+cpu
+torch.cuda_is_available: false
+OpenVINO devices visible: CPU, GPU.0, GPU.1, NPU
+
+So yes, you can probably use the GPU, but right now your Python environment has the CPU-only PyTorch build, so the autocoder cannot use the NVIDIA GPU yet. PyTorch’s install page says to use its official selector for the correct Windows/Pip/Python/CUDA install command, and PyTorch exposes torch.cuda.is_available() as the test for whether CUDA is usable.  
+
+What your current checkpoint means
+
+Your current run has already done these things:
+
+✓ Read training .sav
+✓ Filtered NAICS training labels
+✓ Built NAICS dictionary
+✓ Loaded cached BGE-large semantic-memory embeddings
+✓ Built FAISS IndexFlatIP semantic-memory index
+✓ Loaded cached feature embeddings
+✓ Built 62,514 × 80,589 feature matrix
+→ Currently evaluating SGD elastic-net model for NAICS
+
+It has not yet completed:
+
+NAICS model selection
+NAICS final model fit
+training-data NAICS fill for SOC context
+qe4ar SOC model training
+qe5ar SOC model training
+scoring Statewide Q1 2026.sav
+writing final .sav
+saving final model bundle
+
+If you stop now, you probably will not have a trained model yet, unless a .joblib file already exists. But your embedding cache and FAISS-ready cached .npy files will remain, so the restart will not begin from scratch.
+
+Before stopping: check if a model already exists
+
+Run:
+
+Test-Path "C:\laborshed_autocode\naics_soc_laptop_tuned.joblib"
+Test-Path "C:\laborshed_autocode\naics_soc_laptop_tuned.joblib.summary.json"
+Test-Path "C:\laborshed_autocode\naics_soc_lane1.joblib"
+Test-Path "C:\laborshed_autocode\naics_soc_lane1.joblib.summary.json"
+Test-Path "C:\laborshed_autocode\laborshed_scored_lane1.sav"
+
+Also check recent files:
+
+Get-ChildItem "C:\laborshed_autocode" -File -Recurse |
+  Where-Object {
+    $_.Name -match "lane1|laptop_tuned|scored|\.joblib$|\.summary\.json$|\.sav$|stdout|stderr|log|\.npy$"
+  } |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 40 LastWriteTime,
+    @{Name="MB";Expression={[math]::Round($_.Length / 1MB, 2)}},
+    FullName
+
+If there is no .joblib model and no scored .sav, stopping means “discard current model fitting progress, keep caches.”
+
+If you want GPU acceleration, stop this run cleanly
+
+Because you need to uninstall/reinstall PyTorch, stop the current autocoder first.
+
+Find the process:
+
+Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.Name -like "python*" -and
+    $_.CommandLine -like "*naics_soc_laptop_tuned_autocoder.py*"
+  } |
+  Select-Object ProcessId, CreationDate, CommandLine |
+  Format-List
+
+Stop only that autocoder process:
+
+Stop-Process -Id 12345
+
+Replace 12345 with the actual process ID.
+
+Do not stop the Positron language server process.
+
+Confirm it is stopped:
+
+Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.Name -like "python*" -and
+    $_.CommandLine -like "*naics_soc*autocoder.py*"
+  } |
+  Select-Object ProcessId, CreationDate, CommandLine |
+  Format-List
+
+You want zero autocoder processes before changing PyTorch.
+
+Set up Hugging Face token or remove bad token noise
+
+The warning says Hugging Face is unauthenticated. This is not fatal, but clean it up before rerunning.
+
+If you have a read-only Hugging Face token:
+
+$env:HF_TOKEN = "hf_your_real_token_here"
+
+Use straight quotes, not curly quotes.
+
+If you do not want to use a token right now:
+
+Remove-Item Env:\HF_TOKEN -ErrorAction SilentlyContinue
+
+Hugging Face documents that HF_TOKEN overrides the token stored on the machine, so do not set it to an empty string.  
+
+Install CUDA-enabled PyTorch
+
+Your GPU is visible, but current PyTorch is CPU-only:
+
+torch 2.11.0+cpu
+cuda_is_available: false
+
+First uninstall CPU-only torch:
+
+cd C:\laborshed_autocode
+.\.venv\Scripts\Activate.ps1
+python -m pip uninstall -y torch torchvision torchaudio
+
+Then install CUDA PyTorch.
+
+Because your driver reports CUDA 12.8, I would first try the official PyTorch selector. Select:
+
+OS: Windows
+Package: Pip
+Language: Python
+Compute Platform: CUDA
+
+and use the command it gives you. PyTorch’s site is the source of truth for the correct command.  
+
+Given your nvidia-smi reports CUDA 12.8, a conservative install to try is CUDA 12.6:
+
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+
+Why CUDA 12.6? PyTorch’s release notes say CUDA 12.8 binaries are being removed in favor of CUDA 13.0 and CUDA 12.6, and they specifically mention switching pinned cu128 installs to cu130 or cu126. Since your driver reports CUDA 12.8, cu126 is the safer first try than cu130.  
+
+If that fails because of Python 3.14 wheel availability, the practical fix is to create a Python 3.12 or 3.13 virtual environment for this project. I would not fight PyTorch wheel compatibility for days. The workhorse matters more than the paint on the barn.
+
+Verify CUDA PyTorch
+
+Run:
+
+python -c "import torch; print('torch:', torch.__version__); print('cuda available:', torch.cuda.is_available()); print('cuda version:', torch.version.cuda); print('device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO CUDA')"
+
+You want to see:
+
+cuda available: True
+device: NVIDIA GeForce RTX 2050
+
+Then run:
+
+nvidia-smi
+
+Rerun the GPU probe
+
+After installing CUDA PyTorch, run:
+
+cd C:\laborshed_autocode
+.\.venv\Scripts\python.exe -u .\gpu_acceleration_probe.py `
+  --samples 128 `
+  --pairs 128 `
+  --out_json "C:\laborshed_autocode\gpu_acceleration_probe_AFTER_CUDA.json"
+
+Then paste back:
+
+Get-Content "C:\laborshed_autocode\gpu_acceleration_probe_AFTER_CUDA.json"
+
+The key result is whether you see:
+
+"cuda_is_available": true
+
+and whether the CUDA benchmark is faster than CPU.
+
+Updated restart command using the NVIDIA GPU
+
+Once CUDA works, restart with a new CUDA cache folder so we can tell whether GPU embeddings are actually being created:
+
+cd C:\laborshed_autocode
+$env:PYTHONUTF8="1"
+$env:PYTHONIOENCODING="utf-8"
+$env:HF_HOME="C:\laborshed_autocode\hf_cache"
+$env:HF_HUB_CACHE="C:\laborshed_autocode\hf_cache\hub"
+$env:HF_HUB_DISABLE_PROGRESS_BARS="1"
+$env:OMP_NUM_THREADS="1"
+$env:OPENBLAS_NUM_THREADS="1"
+$env:MKL_NUM_THREADS="1"
+$env:BLIS_NUM_THREADS="1"
+$env:NUMEXPR_NUM_THREADS="1"
+$env:TOKENIZERS_PARALLELISM="false"
+.\.venv\Scripts\python.exe -u .\naics_soc_laptop_tuned_autocoder.py `
+  --mode train_and_score `
+  --train_sav "C:\laborshed_autocode\laborshed_train.sav" `
+  --score_sav "C:\laborshed_autocode\Statewide Q1 2026.sav" `
+  --out_sav "C:\laborshed_autocode\laborshed_scored_gpu_lane1.sav" `
+  --log_txt "C:\laborshed_autocode\naics_soc_gpu_lane1_log.txt" `
+  --model_out "C:\laborshed_autocode\naics_soc_gpu_lane1.joblib" `
+  --save_model `
+  --profile accuracy `
+  --model_search robust `
+  --candidate_models "sgd,linear_svc,complement_nb" `
+  --use_embeddings `
+  --use_semantic_memory `
+  --semantic_backend faiss `
+  --embedding_model "BAAI/bge-large-en-v1.5" `
+  --embedding_backend torch `
+  --embedding_device cuda `
+  --embedding_batch_size 8 `
+  --embedding_chunk_size 1024 `
+  --embedding_progress_every 2048 `
+  --embedding_cache_dir "C:\laborshed_autocode\embedding_cache_cuda" `
+  --use_fuzzy_dictionary `
+  --no-use_cross_encoder_reranker `
+  --no-use_probability_calibration `
+  --max_workers 6 `
+  --native_threads 1 `
+  --score_batch_size 2000 `
+  --ensemble_size 1 `
+  --nfolds_naics 3 `
+  --nfolds_major 3 `
+  --nfolds_within 2 `
+  --optuna_trials_naics 0 `
+  --optuna_trials_major 0 `
+  --optuna_trials_within 0 `
+  --joblib_compress 0 `
+  1> "C:\laborshed_autocode\stdout_GPU_LANE1.log" `
+  2> "C:\laborshed_autocode\stderr_GPU_LANE1.log"
+
+Because the RTX 2050 has 4 GB VRAM, start with:
+
+--embedding_batch_size 8
+
+If it runs without CUDA memory errors, try 16 later. Do not jump to 64 on a 4 GB GPU.
+
+Watch GPU usage
+
+In a second terminal:
+
+nvidia-smi -l 5
+
+During embedding phases, you should see GPU memory usage and utilization rise.
+
+Tail logs:
+
+Get-Content "C:\laborshed_autocode\stdout_GPU_LANE1.log" -Tail 80
+Get-Content "C:\laborshed_autocode\stderr_GPU_LANE1.log" -Tail 80
+
+If you see:
+
+CUDA out of memory
+
+rerun with:
+
+--embedding_batch_size 4
+
+What about OpenVINO?
+
+Your probe showed OpenVINO devices:
+
+CPU, GPU.0, GPU.1, NPU
+
+That is promising, but Sentence Transformers reported OpenVINO support was not fully installed. CUDA is the cleaner route because you have a real NVIDIA GPU and nvidia-smi works.
+
+Try OpenVINO later only if CUDA PyTorch cannot be installed:
+
+python -m pip install -U "sentence-transformers[openvino]" optimum-intel openvino
+python -c "from openvino import Core; print(Core().available_devices)"
+
+Sentence Transformers documents OpenVINO as an efficiency backend, but the NVIDIA CUDA path is the one to test first here.  
+
+Should you let the current CPU run finish instead?
+
+Only if you do not want to risk PyTorch installation work right now.
+
+The current CPU run is healthy and in:
+
+[naics] CV candidate: sgd_log_elasticnet
+
+But it is still early. Since you discovered a usable NVIDIA GPU and the current run has not saved a model yet, I would personally stop it, enable CUDA, and restart the GPU lane. The embedding caches survive, and the GPU lane gives you a better chance of finishing future embedding-heavy steps and later cross-encoder experiments.
+
+The short version of the updated plan
+
+1. Check whether .joblib or scored .sav already exists.
+2. Stop the current naics_soc_laptop_tuned_autocoder.py process.
+3. Uninstall CPU-only torch.
+4. Install CUDA PyTorch using the official PyTorch selector, probably cu126 first for your CUDA 12.8 driver.
+5. Verify torch.cuda.is_available() == True.
+6. Rerun gpu_acceleration_probe.py.
+7. Restart Lane 1 with:
+
+--embedding_device cuda
+--embedding_batch_size 8
+--embedding_cache_dir C:\laborshed_autocode\embedding_cache_cuda
+
+8. Watch with:
+
+nvidia-smi -l 5
+
+This is the cleanest way to turn the RTX 2050 from decorative silicon into an actual autocoding mule.
