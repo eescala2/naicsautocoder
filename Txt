@@ -1,0 +1,267 @@
+That crash is not an ML failure. It is a Hugging Face network/cache failure that happened at a terrible time.
+
+Your run had made excellent progress:
+
+✓ NAICS trained
+✓ qe4ar trained
+✓ qe5ar semantic memory completed
+✗ crashed while starting qe5ar feature embeddings
+
+The key failure is this:
+
+[WinError 10060] ... while requesting HEAD https://huggingface.co/BAAI/bge-large-en-v1.5/resolve/main/adapter_config.json
+...
+RuntimeError: Cannot send a request, as the client has been closed.
+
+That means sentence-transformers / transformers tried to contact Hugging Face to check optional model files while loading BAAI/bge-large-en-v1.5 again. The model itself is already cached, but the library still tried HTTP HEAD checks for files like:
+
+adapter_config.json
+processor_config.json
+preprocessor_config.json
+video_preprocessor_config.json
+
+Your network timed out, retries happened, and then the Hugging Face HTTP client tripped over itself. Hugging Face documents HF_HUB_OFFLINE=1 as the switch that prevents HTTP calls and forces use of cached files only. Transformers also documents HF_HUB_OFFLINE=1 and local_files_only=True for cache-only loading.  ￼
+
+What to do now
+
+Do not panic-delete caches. The expensive embedding caches survived:
+
+C:\laborshed_autocode\embedding_cache\NAICS_semantic_memory_93d8de836486b01b1cb632ce.npy
+C:\laborshed_autocode\embedding_cache\NAICS_semantic_memory_cc9994ade25e7f3eefb177b6.npy
+C:\laborshed_autocode\embedding_cache\qe4ar_SOC_semantic_memory_b8871340854a1eab31f7d847.npy
+C:\laborshed_autocode\embedding_cache\feature_embeddings_fit_b8871340854a1eab31f7d847.npy
+C:\laborshed_autocode\embedding_cache\qe5ar_SOC_semantic_memory_181fb3dd24a29827fe630aea.npy
+
+The next restart should use those caches and should be run in offline Hugging Face mode so the script does not try to call the internet mid-run.
+
+Step 1: Confirm the failed process is gone
+
+Run:
+
+Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.Name -like "python*" -and
+    $_.CommandLine -like "*naics_soc*autocoder.py*"
+  } |
+  Select-Object ProcessId, CreationDate, CommandLine |
+  Format-List
+
+If no autocoder process appears, good.
+
+If one is still running, stop it:
+
+Stop-Process -Id 34804
+
+Replace 34804 with the actual process ID.
+
+Step 2: Check whether a model file was saved
+
+Because the crash happened during train_full_bundle(), the final model probably was not saved. Check:
+
+Test-Path "C:\laborshed_autocode\naics_soc_gpu_lane1.joblib"
+Test-Path "C:\laborshed_autocode\naics_soc_gpu_lane1.joblib.summary.json"
+Test-Path "C:\laborshed_autocode\laborshed_scored_gpu_lane1.sav"
+
+If these return False, you need to restart train_and_score.
+
+If a .joblib exists, check its timestamp:
+
+Get-Item "C:\laborshed_autocode\naics_soc_gpu_lane1.joblib" -ErrorAction SilentlyContinue |
+  Select-Object LastWriteTime, Length, FullName
+
+If it was not written after the crash point, do not rely on it.
+
+Step 3: Verify the Hugging Face model can load offline
+
+This is the most important test before restarting the big run.
+
+Run exactly this:
+
+cd C:\laborshed_autocode
+.\.venv\Scripts\Activate.ps1
+$env:HF_HUB_OFFLINE="1"
+$env:TRANSFORMERS_OFFLINE="1"
+$env:HF_HUB_DISABLE_PROGRESS_BARS="1"
+$env:TOKENIZERS_PARALLELISM="false"
+.\.venv\Scripts\python.exe -c "from sentence_transformers import SentenceTransformer; import torch; print('cuda', torch.cuda.is_available()); m=SentenceTransformer('BAAI/bge-large-en-v1.5', device='cuda'); print('loaded offline ok')"
+
+Expected output:
+
+cuda True
+loaded offline ok
+
+If that works, restart the autocoder offline.
+
+If it fails with “could not find files in cache,” then the model is not cached in the cache location being used by that terminal. In that case, temporarily turn offline off and cache it once:
+
+Remove-Item Env:\HF_HUB_OFFLINE -ErrorAction SilentlyContinue
+Remove-Item Env:\TRANSFORMERS_OFFLINE -ErrorAction SilentlyContinue
+.\.venv\Scripts\python.exe -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-large-en-v1.5', device='cuda'); print('cached')"
+
+Then repeat the offline test.
+
+Step 4: Optional but recommended, log in to Hugging Face
+
+This is not enough by itself, because your problem was network instability, but it prevents rate-limit/auth warnings.
+
+cd C:\laborshed_autocode
+.\.venv\Scripts\Activate.ps1
+python -m pip install -U huggingface_hub
+hf auth login
+hf auth whoami
+
+Use a read-only token.
+
+Do not set:
+
+$env:HF_TOKEN = ""
+
+Hugging Face documents that HF_TOKEN, when set, overrides the token stored on your machine. An empty/bad token can create weird behavior.  ￼
+
+Step 5: Restart the run in offline mode
+
+Use the same laptop/GPU-safe setup, but add:
+
+$env:HF_HUB_OFFLINE="1"
+$env:TRANSFORMERS_OFFLINE="1"
+
+Run:
+
+cd C:\laborshed_autocode
+.\.venv\Scripts\Activate.ps1
+$env:PYTHONUTF8="1"
+$env:PYTHONIOENCODING="utf-8"
+$env:HF_HUB_OFFLINE="1"
+$env:TRANSFORMERS_OFFLINE="1"
+$env:HF_HUB_DISABLE_PROGRESS_BARS="1"
+$env:CUDA_VISIBLE_DEVICES="0"
+$env:OMP_NUM_THREADS="1"
+$env:OPENBLAS_NUM_THREADS="1"
+$env:MKL_NUM_THREADS="1"
+$env:BLIS_NUM_THREADS="1"
+$env:NUMEXPR_NUM_THREADS="1"
+$env:TOKENIZERS_PARALLELISM="false"
+.\.venv\Scripts\python.exe -u .\naics_soc_laptop_tuned_autocoder.py `
+  --mode train_and_score `
+  --train_sav "C:\laborshed_autocode\laborshed_train.sav" `
+  --score_sav "C:\laborshed_autocode\Statewide Q1 2026.sav" `
+  --out_sav "C:\laborshed_autocode\laborshed_scored_gpu_lane1.sav" `
+  --log_txt "C:\laborshed_autocode\naics_soc_gpu_lane1_log.txt" `
+  --model_out "C:\laborshed_autocode\naics_soc_gpu_lane1.joblib" `
+  --save_model `
+  --profile accuracy `
+  --model_search robust `
+  --candidate_models "sgd,linear_svc,complement_nb" `
+  --use_embeddings `
+  --use_semantic_memory `
+  --semantic_backend faiss `
+  --embedding_model "BAAI/bge-large-en-v1.5" `
+  --embedding_backend torch `
+  --embedding_device cuda `
+  --embedding_batch_size 16 `
+  --embedding_chunk_size 2048 `
+  --embedding_progress_every 2048 `
+  --embedding_cache_dir "C:\laborshed_autocode\embedding_cache" `
+  --use_fuzzy_dictionary `
+  --no-use_cross_encoder_reranker `
+  --no-use_probability_calibration `
+  --max_workers 6 `
+  --native_threads 1 `
+  --score_batch_size 2000 `
+  --ensemble_size 1 `
+  --nfolds_naics 3 `
+  --nfolds_major 3 `
+  --nfolds_within 2 `
+  --optuna_trials_naics 0 `
+  --optuna_trials_major 0 `
+  --optuna_trials_within 0 `
+  --joblib_compress 0 `
+  1> "C:\laborshed_autocode\stdout_GPU_LANE1_RESTART_OFFLINE.log" `
+  2> "C:\laborshed_autocode\stderr_GPU_LANE1_RESTART_OFFLINE.log"
+
+What will be repeated vs reused
+
+Because the script did not finish, it likely has to redo model training from the beginning. But this restart should be much faster than a cold run because the heavy embedding caches now exist.
+
+Likely reused:
+
+NAICS semantic memory cache
+NAICS feature embeddings
+NAICS scoring embeddings
+qe4ar semantic memory cache
+qe4ar feature embeddings
+qe5ar semantic memory cache
+
+Likely still needs to do again:
+
+NAICS supervised model selection/training
+qe4ar supervised model selection/training
+qe5ar feature embeddings
+qe5ar supervised model selection/training
+final scoring
+saving model and .sav
+
+The biggest loss is that qe4ar supervised training needs to rerun because the bundle was not saved yet. The biggest win is that the very expensive qe4ar and qe5ar embedding work should mostly not rerun.
+
+Step 6: Watch the restart for cache hits
+
+The restart should quickly show lines like:
+
+Loading cached embeddings: ...
+
+For qe5ar, the important one is:
+
+[qe5ar_SOC_semantic_memory] Loading cached embeddings: C:\laborshed_autocode\embedding_cache\qe5ar_SOC_semantic_memory_181fb3dd24a29827fe630aea.npy
+
+Then it should get back to:
+
+[qe5ar] Building features...
+
+without Hugging Face network retries.
+
+Step 7: If it still tries the internet
+
+If you still see lines like:
+
+requesting HEAD https://huggingface.co/...
+
+then offline mode did not reach the Python process. Check the active process command and environment is harder from outside, so the simplest fix is to run the offline load test again in the exact same terminal, then immediately run the autocoder command from that same terminal.
+
+You can also set persistent user-level environment variables:
+
+setx HF_HUB_OFFLINE "1"
+setx TRANSFORMERS_OFFLINE "1"
+setx HF_HUB_DISABLE_PROGRESS_BARS "1"
+
+Then close and reopen Positron/PowerShell.
+
+Only do this after the model is cached. Offline mode will fail if a required model file is not already cached.
+
+Updated time estimate after restart
+
+If the caches hit:
+
+NAICS replay:       30 minutes to 2 hours
+qe4ar replay:       2 to 5 hours
+qe5ar remaining:    4 to 10 hours
+final scoring/save: 1 to 4 hours
+
+So I would expect:
+
+7 to 21 hours
+
+The good news is that the crash happened after several valuable caches were saved.
+
+For the next script version
+
+This crash shows the script should eventually be patched to support:
+
+--hf_offline
+
+and internally load SentenceTransformer(..., local_files_only=True) or set the Hugging Face offline flags before importing/loading models. It should also checkpoint after NAICS and after qe4ar so a network hiccup cannot erase supervised-training progress.
+
+But for right now, the practical fix is:
+
+Run offline mode + restart with existing embedding caches.
+
+You were very close to the finish. The machine tripped over a phone call to Hugging Face, not over the actual prediction machinery.
